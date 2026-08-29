@@ -1,0 +1,22 @@
+name: henri_env
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.13
+  - pip
+  - pandas=2.3.3
+  - jupyterlab=4.4.10
+  - notebook=7.4.7
+  - numpy=2.3.4
+  - ipykernel=7.1.0
+  - matplotlib=3.10.8
+  - ipywidgets=8.1.8
+  - sympy=1.14.0
+  - osmnx=2.0.7
+  - geopy=2.4.1
+  - ruff=0.15.5
+  - mypy=1.19.1
+  # The source Mac used Homebrew's ffmpeg. Keeping it inside Conda makes the
+  # recreated environment self-contained for Manim.
+  - ffmpeg

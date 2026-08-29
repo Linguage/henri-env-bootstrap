@@ -1,0 +1,7 @@
+channels:
+  - conda-forge
+  - nodefaults
+channel_priority: strict
+show_channel_urls: true
+custom_channels:
+  conda-forge: https://mirror.nju.edu.cn/anaconda/cloud
