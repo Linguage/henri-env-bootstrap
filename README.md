@@ -1,27 +1,41 @@
 # henri-env-bootstrap
 
-从本机 `henri_env` 审计结果生成的可复现安装仓库。它会在 macOS 或 Linux 上：
+从本机 `henri_env` 审计结果生成的可复现环境协调仓库。它会在 macOS 或 Linux 上：
 
 1. 自动发现 Conda；若没有，则安装 Miniforge。
-2. 创建一个干净的 `henri_env`。
-3. 安装原环境中的数据分析、Jupyter、地理计算、PDF/Office、AI SDK、Manim
-   与开发工具。
-4. 克隆并以 editable 方式安装 `MiaoYan-Notes` 和 `zotero-workbench`。
-5. 注册 Jupyter kernel，并检查导入、重复元数据、pip 依赖及 `ffmpeg`。
+2. 若环境不存在则创建；若已经存在则先核查当前状态。
+3. 只安装或调整与 `environment.yml`、`requirements-pip.txt` 不一致的直接包，
+   不主动查询或升级到清单之外的“最新版本”。
+4. 只在 checkout、editable 安装或 Jupyter kernel 缺失、漂移时处理对应部分。
+5. 最后检查导入、重复元数据、pip 依赖及 `ffmpeg`；无法安全增量修复时明确建议重建。
 
 默认使用清华 TUNA 的 Conda 与 PyPI 镜像，但配置仅对此次安装命令生效，
 不会覆盖目标设备现有的全局 `~/.condarc` 或 pip 配置。
 
-## 一键安装
+## 一键协调
 
 ```bash
-git clone <此仓库地址>
+git clone https://github.com/Linguage/henri-env-bootstrap.git
 cd henri-env-bootstrap
 ./bootstrap.sh
 ```
 
-仓库当前只在本地初始化，还没有远程地址；推送后，把上面的占位地址替换成
-真实 Git URL。
+已有 `henri_env` 时，这条命令不会直接重建环境。它先比较当前安装与仓库清单，
+Conda 和 pip 分别只接收缺失或版本漂移的直接包。无变化的部分会明确显示为
+`already match` 并跳过。
+
+只核查，不做任何修改：
+
+```bash
+./bootstrap.sh --check
+```
+
+`--check` 同时检查清单一致性和运行健康；发现漂移或健康问题时退出码为 4。
+只预览将执行的协调计划、但不把漂移作为命令失败：
+
+```bash
+./bootstrap.sh --dry-run
+```
 
 切换镜像：
 
@@ -41,19 +55,19 @@ cd henri-env-bootstrap
 
 当前镜像状态、端点和各站官方帮助链接见 `docs/mirrors.md`。
 
-如果目标设备已经存在同名环境，安装器会停止以保护它。显式替换：
+只有重复的 `.dist-info` 等污染无法通过普通包安装安全清理时，才显式重建：
 
 ```bash
 ./bootstrap.sh --recreate
 ```
 
-也可以先安装为另一个名称做验收：
+也可以先协调到另一个名称做验收：
 
 ```bash
 ./bootstrap.sh --name henri_env_test --skip-projects --no-kernel
 ```
 
-只检查现有环境：
+只运行导入、重复元数据、`pip check` 与 `ffmpeg` 健康检查，不比较清单：
 
 ```bash
 ./bootstrap.sh --verify-only
@@ -62,6 +76,23 @@ cd henri-env-bootstrap
 更多参数见 `./bootstrap.sh --help`。也可以用 `HENRI_MIRROR` 设置镜像。
 editable 项目默认放在
 `~/henri-projects`，可用 `--projects-dir` 或 `HENRI_PROJECTS_DIR` 修改。
+
+## 核查与更新边界
+
+- `scripts/audit_environment.py` 读取仓库现有清单，只比较直接依赖；核查过程不访问
+  包索引，也不提出清单之外的版本升级。
+- Conda 只在对应直接包缺失或版本不符合 `environment.yml` 时调用 `conda install`。
+- pip 只把缺失或版本不符合 `requirements-pip.txt` 的条目交给安装器；已匹配条目跳过。
+- editable 项目只有在 checkout 缺失、锁定提交漂移或安装位置错误时处理。若 checkout
+  有未提交修改且提交漂移，协调会停止并保留现场。
+- Jupyter kernel 已经指向目标环境 Python 时不会重复注册。
+- 增量协调不会擅自删除额外包或残留元数据。开始修改前会检查重复 distribution
+  metadata；发现此类污染时直接停止，确保不会留下“部分更新但仍不健康”的环境。
+  审查报告后，再决定是否显式使用 `--recreate`。
+
+这里所说的“不健康”不是环境目录损坏，而是解析器看到互相矛盾的包状态。例如同一包
+同时存在多个 `.dist-info` 版本，或 `pip check` 发现已安装版本不满足依赖约束。这类环境
+可能暂时仍能导入模块，但结果依赖元数据扫描顺序，不宜视为可复现状态。
 
 ## 为什么不是直接复制 `conda env export`
 

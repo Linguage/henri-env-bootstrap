@@ -9,6 +9,11 @@ INSTALL_PROJECTS=1
 REGISTER_KERNEL=1
 RECREATE=0
 VERIFY_ONLY=0
+CHECK_ONLY=0
+DRY_RUN=0
+ALIGNMENT_NEEDED=0
+RECONCILE_BLOCKED=0
+UNSAFE_INCREMENTAL=0
 
 usage() {
   sed -n '/^# BEGIN_USAGE$/,/^# END_USAGE$/p' "$0" \
@@ -16,7 +21,7 @@ usage() {
 }
 
 # BEGIN_USAGE
-# Recreate the clean henri_env Conda environment.
+# Reconcile henri_env with the repository's requested configuration.
 #
 # Usage:
 #   ./bootstrap.sh [options]
@@ -27,8 +32,10 @@ usage() {
 #   --mirror NAME        tuna, bfsu, ustc, nju, or official (default: tuna)
 #   --skip-projects      Do not clone/install the two editable projects
 #   --no-kernel          Do not register a Jupyter kernel
-#   --recreate           Remove an existing target environment first
-#   --verify-only        Only verify an existing target environment
+#   --check              Audit requested state and health without changing anything
+#   --dry-run            Show the reconciliation plan without changing anything
+#   --recreate           Remove and rebuild an existing target environment
+#   --verify-only        Run health verification without checking requested versions
 #   -h, --help           Show this help
 #
 # Environment variables:
@@ -57,11 +64,26 @@ while (($#)); do
     --skip-projects) INSTALL_PROJECTS=0; shift ;;
     --no-kernel) REGISTER_KERNEL=0; shift ;;
     --recreate) RECREATE=1; shift ;;
+    --check) CHECK_ONLY=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     --verify-only) VERIFY_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if ((CHECK_ONLY + VERIFY_ONLY > 1)); then
+  echo "--check and --verify-only are mutually exclusive." >&2
+  exit 2
+fi
+if ((DRY_RUN && VERIFY_ONLY)); then
+  echo "--dry-run cannot be combined with --verify-only." >&2
+  exit 2
+fi
+if ((RECREATE && (CHECK_ONLY || VERIFY_ONLY))); then
+  echo "--recreate cannot be combined with --check or --verify-only." >&2
+  exit 2
+fi
 
 case "$MIRROR" in
   tuna)
@@ -157,7 +179,21 @@ install_miniforge() {
   printf '%s\n' "${prefix}/bin/conda"
 }
 
-CONDA_BIN="$(find_conda || install_miniforge)"
+if CONDA_BIN="$(find_conda)"; then
+  :
+elif ((CHECK_ONLY || DRY_RUN || VERIFY_ONLY)); then
+  echo "Conda is not installed or discoverable." >&2
+  if ((DRY_RUN)); then
+    echo "  - would install Miniforge before creating the target environment"
+    exit 0
+  fi
+  if ((CHECK_ONLY)); then
+    exit 4
+  fi
+  exit 1
+else
+  CONDA_BIN="$(install_miniforge)"
+fi
 
 environment_exists() {
   "$CONDA_BIN" env list | awk -v target="$ENV_NAME" '$1 == target { found = 1 } END { exit !found }'
@@ -173,65 +209,278 @@ if ((VERIFY_ONLY)); then
   exit 0
 fi
 
-if environment_exists; then
-  if ((RECREATE)); then
-    echo "Removing existing Conda environment '$ENV_NAME'"
-    "$CONDA_BIN" env remove --yes --name "$ENV_NAME"
-  else
-    echo "Conda environment '$ENV_NAME' already exists." >&2
-    echo "Use --recreate to replace it, or --name to install a separate copy." >&2
+base_python() {
+  local conda_base
+  conda_base="$($CONDA_BIN info --base)"
+  printf '%s\n' "${conda_base}/bin/python"
+}
+
+target_python() {
+  "$CONDA_BIN" run -n "$ENV_NAME" python -c 'import sys; print(sys.executable)'
+}
+
+preflight_metadata_safety() {
+  local python_bin output package_name
+  local -a duplicates=()
+  python_bin="$(target_python)"
+  output="$("$python_bin" "$ROOT_DIR/scripts/audit_environment.py" \
+    --component metadata \
+    --format specs \
+    --exit-zero)"
+  while IFS= read -r package_name; do
+    [[ -n "$package_name" ]] && duplicates[${#duplicates[@]}]="$package_name"
+  done <<< "$output"
+
+  if ((${#duplicates[@]} == 0)); then
+    echo "Python distribution metadata has no duplicate records."
+    return
+  fi
+
+  ALIGNMENT_NEEDED=1
+  UNSAFE_INCREMENTAL=1
+  echo "Incremental reconciliation is unsafe: duplicate Python metadata was found." >&2
+  printf '  - %s\n' "${duplicates[@]}" >&2
+  if ((!CHECK_ONLY && !DRY_RUN)); then
+    echo "No environment changes were made. Run --check for details or use --recreate explicitly." >&2
     exit 3
   fi
-fi
+}
 
-echo "Creating Conda environment '$ENV_NAME'"
-echo "Using package mirror: $MIRROR"
-CONDARC="$CONDARC_FILE" "$CONDA_BIN" env create \
-  --yes --name "$ENV_NAME" --file "$ROOT_DIR/environment.yml"
+reconcile_conda_packages() {
+  local output spec
+  local -a changes=()
+  output="$("$(base_python)" "$ROOT_DIR/scripts/audit_environment.py" \
+    --component conda \
+    --environment "$ROOT_DIR/environment.yml" \
+    --conda-bin "$CONDA_BIN" \
+    --env-name "$ENV_NAME" \
+    --format specs \
+    --exit-zero)"
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] && changes[${#changes[@]}]="$spec"
+  done <<< "$output"
 
-echo "Installing pinned direct pip packages"
-"$CONDA_BIN" run -n "$ENV_NAME" python -m pip install \
-  --disable-pip-version-check \
-  --index-url "$PIP_INDEX_URL" \
-  --requirement "$ROOT_DIR/requirements-pip.txt"
+  if ((${#changes[@]} == 0)); then
+    echo "Conda direct packages already match environment.yml."
+    return
+  fi
 
-if ((INSTALL_PROJECTS)); then
-  command -v git >/dev/null 2>&1 || { echo "git is required for editable projects." >&2; exit 1; }
-  mkdir -p "$PROJECTS_DIR"
+  ALIGNMENT_NEEDED=1
+  echo "Conda packages requiring reconciliation:"
+  printf '  - %s\n' "${changes[@]}"
+  if ((CHECK_ONLY || DRY_RUN)); then
+    return
+  fi
+
+  CONDARC="$CONDARC_FILE" "$CONDA_BIN" install \
+    --yes --name "$ENV_NAME" "${changes[@]}"
+}
+
+reconcile_pip_packages() {
+  local python_bin output spec
+  local -a changes=()
+  python_bin="$(target_python)"
+  output="$("$python_bin" "$ROOT_DIR/scripts/audit_environment.py" \
+    --component pip \
+    --requirements "$ROOT_DIR/requirements-pip.txt" \
+    --format specs \
+    --exit-zero)"
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] && changes[${#changes[@]}]="$spec"
+  done <<< "$output"
+
+  if ((${#changes[@]} == 0)); then
+    echo "Direct pip packages already match requirements-pip.txt."
+    return
+  fi
+
+  ALIGNMENT_NEEDED=1
+  echo "pip packages requiring reconciliation:"
+  printf '  - %s\n' "${changes[@]}"
+  if ((CHECK_ONLY || DRY_RUN)); then
+    return
+  fi
+
+  "$python_bin" -m pip install \
+    --disable-pip-version-check \
+    --index-url "$PIP_INDEX_URL" \
+    "${changes[@]}"
+}
+
+editable_project_location() {
+  local python_bin="$1"
+  local project_name="$2"
+  PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 \
+    "$python_bin" -m pip show "$project_name" 2>/dev/null \
+    | sed -n 's/^Editable project location: //p'
+}
+
+reconcile_projects() {
+  local python_bin project_name repository commit directory destination
+  local current_commit editable_location needs_install
+  ((INSTALL_PROJECTS)) || return 0
+  command -v git >/dev/null 2>&1 || { echo "git is required for editable projects." >&2; return 1; }
+  python_bin="$(target_python)"
+
+  if [[ ! -d "$PROJECTS_DIR" ]]; then
+    ALIGNMENT_NEEDED=1
+    echo "Editable-project root is missing: $PROJECTS_DIR"
+    if ((CHECK_ONLY || DRY_RUN)); then
+      echo "  - would create it when applying the plan"
+    else
+      mkdir -p "$PROJECTS_DIR"
+    fi
+  fi
 
   while IFS='|' read -r project_name repository commit directory; do
     [[ -n "$project_name" && "${project_name:0:1}" != "#" ]] || continue
     destination="${PROJECTS_DIR}/${directory}"
+    needs_install=0
 
     if [[ ! -e "$destination" ]]; then
-      echo "Cloning $project_name"
-      git clone "$repository" "$destination"
-      git -C "$destination" checkout --detach "$commit"
+      ALIGNMENT_NEEDED=1
+      needs_install=1
+      echo "$project_name checkout is missing: $destination"
+      if ((CHECK_ONLY || DRY_RUN)); then
+        echo "  - would clone $repository at $commit"
+      else
+        git clone "$repository" "$destination"
+        git -C "$destination" checkout --detach "$commit"
+      fi
     elif [[ ! -d "$destination/.git" ]]; then
       echo "Expected a Git checkout at $destination; refusing to overwrite it." >&2
-      exit 1
+      RECONCILE_BLOCKED=1
+      continue
     else
       current_commit="$(git -C "$destination" rev-parse HEAD)"
       if [[ "$current_commit" != "$commit" ]]; then
-        echo "Using existing $project_name checkout at $current_commit (lock: $commit)"
+        ALIGNMENT_NEEDED=1
+        if [[ -n "$(git -C "$destination" status --porcelain)" ]]; then
+          echo "$project_name checkout has local changes and differs from its lock." >&2
+          echo "  current: $current_commit" >&2
+          echo "  lock:    $commit" >&2
+          RECONCILE_BLOCKED=1
+        elif ((CHECK_ONLY || DRY_RUN)); then
+          echo "$project_name would move from $current_commit to $commit"
+        else
+          if ! git -C "$destination" cat-file -e "${commit}^{commit}" 2>/dev/null; then
+            git -C "$destination" fetch --prune origin
+          fi
+          git -C "$destination" checkout --detach "$commit"
+        fi
       fi
     fi
 
-    "$CONDA_BIN" run -n "$ENV_NAME" python -m pip install \
-      --disable-pip-version-check --no-deps --editable "$destination"
+    editable_location="$(editable_project_location "$python_bin" "$project_name")"
+    if [[ "${editable_location%/}" != "${destination%/}" ]]; then
+      ALIGNMENT_NEEDED=1
+      needs_install=1
+      echo "$project_name editable install requires reconciliation."
+      if [[ -n "$editable_location" ]]; then
+        echo "  current: $editable_location"
+      else
+        echo "  current: not installed"
+      fi
+      echo "  target:  $destination"
+    fi
+
+    if ((needs_install && !CHECK_ONLY && !DRY_RUN && !RECONCILE_BLOCKED)); then
+      "$python_bin" -m pip install \
+        --disable-pip-version-check --no-deps --editable "$destination"
+    fi
   done < "$ROOT_DIR/projects.lock"
-fi
+}
 
-if ((REGISTER_KERNEL)); then
-  echo "Registering Jupyter kernel '$ENV_NAME'"
-  "$CONDA_BIN" run -n "$ENV_NAME" python -m ipykernel install \
+reconcile_kernel() {
+  local python_bin output
+  ((REGISTER_KERNEL)) || return 0
+  python_bin="$(target_python)"
+  output="$("$python_bin" "$ROOT_DIR/scripts/audit_environment.py" \
+    --component kernel \
+    --env-name "$ENV_NAME" \
+    --format specs \
+    --exit-zero)"
+  if [[ -z "$output" ]]; then
+    echo "Jupyter kernel '$ENV_NAME' already points to the target environment."
+    return
+  fi
+
+  ALIGNMENT_NEEDED=1
+  echo "Jupyter kernel '$ENV_NAME' is missing or points to another Python."
+  if ((CHECK_ONLY || DRY_RUN)); then
+    echo "  - would register the target environment kernel"
+    return
+  fi
+  "$python_bin" -m ipykernel install \
     --user --name "$ENV_NAME" --display-name "Python ($ENV_NAME)"
+}
+
+environment_present=0
+if environment_exists; then
+  environment_present=1
 fi
 
-run_verify
+if ((RECREATE && environment_present)); then
+  ALIGNMENT_NEEDED=1
+  if ((DRY_RUN)); then
+    echo "Would remove and recreate Conda environment '$ENV_NAME'."
+    exit 0
+  fi
+  echo "Removing existing Conda environment '$ENV_NAME'"
+  "$CONDA_BIN" env remove --yes --name "$ENV_NAME"
+  environment_present=0
+fi
+
+if ((!environment_present)); then
+  ALIGNMENT_NEEDED=1
+  if ((CHECK_ONLY || DRY_RUN)); then
+    echo "Conda environment '$ENV_NAME' is missing."
+    echo "  - would create it from environment.yml"
+    if ((CHECK_ONLY)); then
+      exit 4
+    fi
+    exit 0
+  fi
+  echo "Creating Conda environment '$ENV_NAME'"
+  echo "Using package mirror: $MIRROR"
+  CONDARC="$CONDARC_FILE" "$CONDA_BIN" env create \
+    --yes --name "$ENV_NAME" --file "$ROOT_DIR/environment.yml"
+fi
+
+preflight_metadata_safety
+reconcile_conda_packages
+reconcile_pip_packages
+reconcile_projects
+reconcile_kernel
+
+if ((RECONCILE_BLOCKED && !CHECK_ONLY && !DRY_RUN)); then
+  echo "Reconciliation stopped because a managed project needs manual attention." >&2
+  exit 1
+fi
+
+if ((CHECK_ONLY || DRY_RUN)); then
+  health_status=0
+  run_verify || health_status=$?
+  if ((CHECK_ONLY && (ALIGNMENT_NEEDED || health_status != 0))); then
+    echo "Check found configuration drift or health problems." >&2
+    exit 4
+  fi
+  if ((DRY_RUN)); then
+    echo "Dry run complete; no environment changes were made."
+  else
+    echo "Requested configuration and environment health are aligned."
+  fi
+  exit 0
+fi
+
+if ! run_verify; then
+  echo "Incremental reconciliation could not restore full environment health." >&2
+  echo "Review the verification output; duplicate stale metadata may require --recreate." >&2
+  exit 1
+fi
 
 conda_base="$($CONDA_BIN info --base)"
 echo
-echo "Installation complete. Activate it with:"
+echo "Environment reconciliation complete. Activate it with:"
 echo "  source \"${conda_base}/etc/profile.d/conda.sh\""
 echo "  conda activate ${ENV_NAME}"
