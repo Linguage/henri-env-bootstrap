@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -36,17 +37,24 @@ REQUIRED_IMPORTS = {
 }
 
 
+def normalize_name(value: str) -> str:
+    """Normalize distribution names according to the PyPA name rules."""
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
 def duplicate_distributions() -> dict[str, list[str]]:
     versions: defaultdict[str, list[str]] = defaultdict(list)
     for distribution in importlib.metadata.distributions():
         raw_name = distribution.metadata.get("Name") or ""
-        name = raw_name.lower().replace("_", "-")
+        name = normalize_name(raw_name)
         versions[name].append(distribution.version)
     return {name: found for name, found in versions.items() if len(found) > 1}
 
 
 def main() -> int:
-    print(f"Python {platform.python_version()} ({platform.system()} {platform.machine()})")
+    print(
+        f"Python {platform.python_version()} ({platform.system()} {platform.machine()})"
+    )
     failures: list[str] = []
 
     for module_name, label in REQUIRED_IMPORTS.items():
@@ -58,7 +66,8 @@ def main() -> int:
     duplicates = duplicate_distributions()
     if duplicates:
         rendered = ", ".join(
-            f"{name}={sorted(set(versions))}" for name, versions in sorted(duplicates.items())
+            f"{name}={sorted(set(versions))}"
+            for name, versions in sorted(duplicates.items())
         )
         failures.append(f"duplicate distribution metadata: {rendered}")
 
@@ -69,7 +78,9 @@ def main() -> int:
         text=True,
     )
     if pip_check.returncode:
-        failures.append(f"pip check: {pip_check.stdout.strip() or pip_check.stderr.strip()}")
+        failures.append(
+            f"pip check: {pip_check.stdout.strip() or pip_check.stderr.strip()}"
+        )
 
     if shutil.which("ffmpeg") is None:
         failures.append("ffmpeg is not available")
@@ -80,9 +91,13 @@ def main() -> int:
             print(f"- {failure}", file=sys.stderr)
         return 1
 
-    print("Verification passed: imports, metadata, pip dependencies, and ffmpeg are healthy.")
+    print(
+        "Verification passed: imports, metadata, pip dependencies, and ffmpeg are healthy."
+    )
     if shutil.which("latex") is None:
-        print("Optional: install a TeX distribution for Manim scenes that render LaTeX.")
+        print(
+            "Optional: install a TeX distribution for Manim scenes that render LaTeX."
+        )
     return 0
 
 

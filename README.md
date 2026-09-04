@@ -55,11 +55,30 @@ Conda 和 pip 分别只接收缺失或版本漂移的直接包。无变化的部
 
 当前镜像状态、端点和各站官方帮助链接见 `docs/mirrors.md`。
 
-只有重复的 `.dist-info` 等污染无法通过普通包安装安全清理时，才显式重建：
+只有确认不需要保留旧环境时，才直接删除并重建：
 
 ```bash
 ./bootstrap.sh --recreate
 ```
+
+`--recreate` 会先删除目标环境，安装失败时没有可直接切回的旧副本。对于当前这类
+重复 `.dist-info` 污染，推荐先在旁路环境中完整创建和验收，不要手工逐个删除元数据：
+
+```bash
+./bootstrap.sh --name henri_env_candidate --skip-projects --no-kernel
+./bootstrap.sh --name henri_env_candidate --check --skip-projects --no-kernel
+```
+
+确认候选环境通过核查后，在没有激活 `henri_env` 的终端中保留旧环境为备份，再切换名称：
+
+```bash
+conda rename -n henri_env henri_env_backup_before_rebuild
+conda rename -n henri_env_candidate henri_env
+./bootstrap.sh
+```
+
+最后一条命令会补齐 editable 项目和 Jupyter kernel，并重新验证。确认新环境稳定后，
+再自行删除备份。以上创建候选环境的步骤会下载依赖；仓库自身的轻量测试不会。
 
 也可以先协调到另一个名称做验收：
 
@@ -79,8 +98,9 @@ editable 项目默认放在
 
 ## 核查与更新边界
 
-- `scripts/audit_environment.py` 读取仓库现有清单，只比较直接依赖；核查过程不访问
-  包索引，也不提出清单之外的版本升级。
+- `scripts/audit_environment.py` 核查 Conda/pip 直接依赖、重复 Python 元数据和
+  Jupyter kernel；editable checkout 与安装位置由 `bootstrap.sh` 核查。
+- 核查过程不访问包索引，也不提出清单之外的版本升级。
 - Conda 只在对应直接包缺失或版本不符合 `environment.yml` 时调用 `conda install`。
 - pip 只把缺失或版本不符合 `requirements-pip.txt` 的条目交给安装器；已匹配条目跳过。
 - editable 项目只有在 checkout 缺失、锁定提交漂移或安装位置错误时处理。若 checkout
@@ -116,3 +136,11 @@ editable 路径。直接导出会把污染状态和绝对路径一起带到新�
 ```
 
 刷新后应先审查差异，再人工更新干净安装输入；不要把新的冲突直接复制进去。
+
+## 轻量测试
+
+以下命令只运行 Shell/Python 语法检查、单元测试和帮助命令，不创建或下载 Conda 环境：
+
+```bash
+./scripts/smoke-test.sh
+```

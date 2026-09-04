@@ -14,6 +14,7 @@ from scripts.audit_environment import (
     parse_conda_environment,
     parse_pip_requirements,
 )
+from scripts.verify import duplicate_distributions
 
 
 class AuditEnvironmentTests(unittest.TestCase):
@@ -138,6 +139,19 @@ class AuditEnvironmentTests(unittest.TestCase):
         self.assertEqual(len(drift), 1)
         self.assertEqual(drift[0].spec, "example-package")
         self.assertEqual(drift[0].installed, ("1.0", "1.0"))
+
+    def test_verifier_uses_canonical_distribution_names(self):
+        first = mock.Mock(version="1.0")
+        first.metadata.get.return_value = "Example.Package"
+        second = mock.Mock(version="2.0")
+        second.metadata.get.return_value = "example_package"
+        with mock.patch(
+            "scripts.verify.importlib.metadata.distributions",
+            return_value=[first, second],
+        ):
+            duplicates = duplicate_distributions()
+
+        self.assertEqual(duplicates, {"example-package": ["1.0", "2.0"]})
 
 
 if __name__ == "__main__":
